@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="addon">
+  <id>de.marvinborner.zathura-note</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <extends>org.pwmt.zathura</extends>
+  <name>Zathura-PDF-MuPDF</name>
+  <summary>.note plugin for zathura</summary>
+  <update_contact>zathura@marvinborner.de</update_contact>
+</component>
