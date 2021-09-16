@@ -8,6 +8,7 @@ typedef struct {
 	zip_t *zip;
 	plist_t session_plist;
 	plist_t metadata_plist;
+	double width, height; // Page size is constant
 } note_document_t;
 
 // Found by reverse engineering
@@ -26,7 +27,7 @@ static void plist_dump(plist_t plist, int depth)
 		plist_get_bool_val(plist, &val);
 		printf("<bool>%s</bool>\n", val ? "true" : "false");
 	} else if (PLIST_IS_UINT(plist)) {
-		unsigned long val;
+		size_t val;
 		plist_get_uint_val(plist, &val);
 		printf("<uint>%lu</uint>\n", val);
 	} else if (PLIST_IS_REAL(plist)) {
@@ -93,8 +94,9 @@ static void plist_dump(plist_t plist, int depth)
 		plist_get_date_val(plist, &sec, &usec);
 		printf("<date>%d</date>\n", sec); // Since 01/01/2001
 	} else if (PLIST_IS_DATA(plist)) {
-		unsigned long length;
+		size_t length;
 		const char *val = plist_get_data_ptr(plist, &length);
+		(void)val;
 		printf("<data length=\"%lu\">...</data>\n", length);
 	} else if (PLIST_IS_KEY(plist)) {
 		char *val;
@@ -102,7 +104,7 @@ static void plist_dump(plist_t plist, int depth)
 		printf("<key>%s</key>\n", val);
 		free(val);
 	} else if (PLIST_IS_UID(plist)) {
-		unsigned long val;
+		size_t val;
 		plist_get_uid_val(plist, &val);
 		printf("<uid>%lu</uid>\n", val);
 	}
@@ -141,75 +143,7 @@ static zathura_error_t plist_load(zip_t *zip, plist_t *plist, const char *root_n
 	return ZATHURA_ERROR_OK;
 }
 
-static plist_t plist_session_objects(plist_t session_plist)
-{
-	plist_t objects = plist_dict_get_item(session_plist, "$objects");
-	if (!PLIST_IS_ARRAY(objects)) {
-		fprintf(stderr, "Invalid objects type\n");
-		return 0;
-	}
-	return objects;
-}
-
-static plist_t plist_session_format_information(plist_t session_plist)
-{
-	plist_t objects = plist_session_objects(session_plist);
-	if (!objects)
-		return 0;
-
-	plist_t format = plist_array_get_item(objects, SESSION_OBJECTS_FORMAT_INFO);
-	if (!PLIST_IS_DICT(format)) {
-		fprintf(stderr, "Invalid format information type\n");
-		return 0;
-	}
-	return format;
-}
-
-static plist_t plist_handwriting_overlay(plist_t session_plist)
-{
-	plist_t objects = plist_session_objects(session_plist);
-	if (!objects)
-		return 0;
-
-	plist_t format = plist_array_get_item(objects, SESSION_OBJECTS_FORMAT_INFO);
-	if (!PLIST_IS_DICT(format)) {
-		fprintf(stderr, "Invalid format information\n");
-		return 0;
-	}
-
-	plist_t overlay_pointer = plist_dict_get_item(format, "Handwriting Overlay");
-	if (!PLIST_IS_UID(overlay_pointer)) {
-		fprintf(stderr, "Invalid handwriting overlay pointer\n");
-		return 0;
-	}
-
-	unsigned long index;
-	plist_get_uid_val(overlay_pointer, &index);
-
-	plist_t overlay_info = plist_array_get_item(objects, index);
-	if (!PLIST_IS_DICT(overlay_info)) {
-		fprintf(stderr, "Invalid overlay info item\n");
-		return 0;
-	}
-
-	plist_t spatial_hash = plist_dict_get_item(overlay_info, "SpatialHash");
-	if (!PLIST_IS_UID(spatial_hash)) {
-		fprintf(stderr, "Invalid spatial hash\n");
-		return 0;
-	}
-
-	plist_get_uid_val(spatial_hash, &index);
-
-	plist_t overlay = plist_array_get_item(objects, index);
-	if (!PLIST_IS_DICT(overlay)) {
-		fprintf(stderr, "Invalid handwriting overlay\n");
-		return 0;
-	}
-
-	return overlay;
-}
-
-static const void *plist_dict_get_data(plist_t node, const char *name, unsigned long *length)
+static const void *plist_dict_get_data(plist_t node, const char *name, size_t *length)
 {
 	plist_t data = plist_dict_get_item(node, name);
 	if (!PLIST_IS_DATA(data))
@@ -218,34 +152,113 @@ static const void *plist_dict_get_data(plist_t node, const char *name, unsigned 
 	return chars;
 }
 
-static float plist_page_width(plist_t session_plist)
+static plist_t plist_handwriting_overlay(plist_t session_plist)
 {
-	plist_t objects = plist_session_objects(session_plist);
-	if (!objects)
-		return 0;
-
-	plist_t format = plist_array_get_item(objects, SESSION_OBJECTS_FORMAT_INFO);
-	if (!PLIST_IS_DICT(format)) {
-		fprintf(stderr, "Invalid format information\n");
+	plist_t overlay_pointer = plist_access_path(
+		session_plist, 3, "$objects", SESSION_OBJECTS_FORMAT_INFO, "Handwriting Overlay");
+	if (!PLIST_IS_UID(overlay_pointer)) {
+		fprintf(stderr, "Invalid handwriting overlay pointer\n");
 		return 0;
 	}
 
-	plist_t reflow_state_pointer = plist_dict_get_item(format, "reflowState");
+	size_t index;
+	plist_get_uid_val(overlay_pointer, &index);
+	plist_t spatial_hash =
+		plist_access_path(session_plist, 3, "$objects", index, "SpatialHash");
+	if (!PLIST_IS_UID(spatial_hash)) {
+		fprintf(stderr, "Invalid spatial hash\n");
+		return 0;
+	}
+
+	plist_get_uid_val(spatial_hash, &index);
+	plist_t overlay = plist_access_path(session_plist, 2, "$objects", index);
+	if (!PLIST_IS_DICT(overlay)) {
+		fprintf(stderr, "Invalid handwriting overlay\n");
+		return 0;
+	}
+
+	return overlay;
+}
+
+// TODO: Find more elegant solution for page count (there doesn't seem to be)
+static int plist_page_count(plist_t session_plist, double page_height)
+{
+	plist_t overlay = plist_handwriting_overlay(session_plist);
+	size_t curves_length = 0;
+	const float *curves = plist_dict_get_data(overlay, "curvespoints", &curves_length);
+
+	// Find highest y curve-point
+	double max = 0;
+	for (size_t i = 0; i < curves_length / sizeof(*curves); i += 2)
+		if (curves[i + 1] > max)
+			max = curves[i + 1];
+
+	return (int)(max / page_height) + 1;
+}
+
+static float plist_page_ratio(plist_t session_plist)
+{
+	float ratio = 1.414; // DIN ratio because why not
+
+	plist_t paper_layout_pointer =
+		plist_access_path(session_plist, 3, "$objects", SESSION_OBJECTS_GENERAL_INFO,
+				  "NBNoteTakingSessionDocumentPaperLayoutModelKey");
+	if (!PLIST_IS_UID(paper_layout_pointer)) {
+		fprintf(stderr, "Invalid reflow state pointer\n");
+		return ratio;
+	}
+
+	size_t index;
+	plist_get_uid_val(paper_layout_pointer, &index);
+	plist_t attributes_pointer =
+		plist_access_path(session_plist, 3, "$objects", index, "documentPaperAttributes");
+	if (!PLIST_IS_UID(attributes_pointer)) {
+		fprintf(stderr, "Invalid paper attributes pointer\n");
+		return ratio;
+	}
+
+	plist_get_uid_val(attributes_pointer, &index);
+	plist_t paper_pointer =
+		plist_access_path(session_plist, 3, "$objects", index, "paperIdentifier");
+	if (!PLIST_IS_UID(paper_pointer)) {
+		fprintf(stderr, "Invalid paper identifier pointer\n");
+		return ratio;
+	}
+
+	plist_get_uid_val(paper_pointer, &index);
+	plist_t identifier = plist_access_path(session_plist, 2, "$objects", index);
+	if (!PLIST_IS_STRING(identifier)) {
+		fprintf(stderr, "Invalid paper identifier\n");
+		return ratio;
+	}
+
+	size_t type_length;
+	const char *type = plist_get_string_ptr(identifier, &type_length);
+	if (!memcmp(type, "Legacy:13", type_length))
+		ratio = 1.3; // Or does 13 refer to 13x19"??
+	else if (!memcmp(type, "Legacy:0", type_length))
+		// 0 means page not renderable (?)
+		fprintf(stderr, "Page identifies as not renderable, please report\n");
+	else
+		fprintf(stderr, "Unknown paper identifier, please report: %.*s\n", (int)type_length,
+			type);
+
+	return ratio;
+}
+
+static float plist_page_width(plist_t session_plist)
+{
+	plist_t reflow_state_pointer = plist_access_path(
+		session_plist, 3, "$objects", SESSION_OBJECTS_FORMAT_INFO, "reflowState");
 	if (!PLIST_IS_UID(reflow_state_pointer)) {
 		fprintf(stderr, "Invalid reflow state pointer\n");
 		return 0;
 	}
 
-	unsigned long index;
+	size_t index;
 	plist_get_uid_val(reflow_state_pointer, &index);
-
-	plist_t reflow_state = plist_array_get_item(objects, index);
-	if (!PLIST_IS_DICT(reflow_state)) {
-		fprintf(stderr, "Invalid reflow state item\n");
-		return 0;
-	}
-
-	plist_t page_width = plist_dict_get_item(reflow_state, "pageWidthInDocumentCoordsKey");
+	plist_t page_width = plist_access_path(session_plist, 3, "$objects", index,
+					       "pageWidthInDocumentCoordsKey");
 	if (!PLIST_IS_REAL(page_width)) {
 		fprintf(stderr, "Invalid page width\n");
 		return 0;
@@ -310,8 +323,17 @@ GIRARA_HIDDEN zathura_error_t note_document_open(zathura_document_t *document)
 
 	note_document->zip = zip;
 
+	note_document->width = plist_page_width(note_document->session_plist);
+	if (note_document->width < 1) {
+		fprintf(stderr, "Setting invalid width %f to 500\n", note_document->width);
+		note_document->width = 500;
+	}
+	note_document->height =
+		note_document->width * plist_page_ratio(note_document->session_plist);
+
 	zathura_document_set_data(document, note_document);
-	zathura_document_set_number_of_pages(document, 1); // TODO: Get page count
+	zathura_document_set_number_of_pages(
+		document, plist_page_count(note_document->session_plist, note_document->height));
 
 	free(root_name);
 	return ZATHURA_ERROR_OK;
@@ -330,12 +352,8 @@ GIRARA_HIDDEN zathura_error_t note_document_free(zathura_document_t *document, v
 GIRARA_HIDDEN zathura_error_t note_page_init(zathura_page_t *page)
 {
 	note_document_t *note_document = zathura_document_get_data(zathura_page_get_document(page));
-	float width = plist_page_width(note_document->session_plist);
-	if (width < 1)
-		return ZATHURA_ERROR_NOT_IMPLEMENTED;
-
-	zathura_page_set_width(page, width);
-	zathura_page_set_height(page, width * 1.41); // Always A4?
+	zathura_page_set_width(page, note_document->width);
+	zathura_page_set_height(page, note_document->height);
 
 	return ZATHURA_ERROR_OK;
 }
@@ -359,22 +377,27 @@ GIRARA_HIDDEN zathura_error_t note_page_render_cairo(zathura_page_t *page, void 
 	/* plist_dump(note_document->session_plist, 0); */
 	/* return ZATHURA_ERROR_OK; */
 
+	double height = zathura_page_get_height(page);
+	unsigned int number = zathura_page_get_index(page);
+	double page_start = height * number;
+	double page_end = height * (number + 1);
+
 	// Array of points on curve
-	unsigned long curves_length = 0;
+	size_t curves_length = 0;
 	const float *curves = plist_dict_get_data(overlay, "curvespoints", &curves_length);
 
 	// Specifies the number of points of a curve (using index of *curves)
-	unsigned long curves_num_length = 0;
+	size_t curves_num_length = 0;
 	const unsigned int *curves_num =
 		plist_dict_get_data(overlay, "curvesnumpoints", &curves_num_length);
 
 	// Width of curves
-	unsigned long curves_width_length = 0;
+	size_t curves_width_length = 0;
 	const float *curves_width =
 		plist_dict_get_data(overlay, "curveswidth", &curves_width_length);
 
 	// Colors of curves
-	unsigned long curves_colors_length = 0;
+	size_t curves_colors_length = 0;
 	const char *curves_colors =
 		plist_dict_get_data(overlay, "curvescolors", &curves_colors_length);
 
@@ -383,18 +406,22 @@ GIRARA_HIDDEN zathura_error_t note_page_render_cairo(zathura_page_t *page, void 
 	    !curves_colors_length || !curves_width || !curves_width_length)
 		return ZATHURA_ERROR_NOT_IMPLEMENTED;
 
-	unsigned long limit = curves_num_length / sizeof(*curves_num);
+	size_t limit = curves_num_length / sizeof(*curves_num);
 	unsigned int pos = 0;
-	for (unsigned long i = 0; i < limit; i++) {
+	for (size_t i = 0; i < limit; i++) {
 		const unsigned int length = curves_num[i];
 		const char *color = &curves_colors[i * 4];
 		cairo_set_source_rgba(cairo, color[0] & 0xff, color[1] & 0xff, color[2] & 0xff,
 				      (float)(color[3] & 0xff) / 255);
 		cairo_set_line_width(cairo, curves_width[i]);
-		cairo_move_to(cairo, curves[pos], curves[pos + 1]);
 
-		for (unsigned int j = pos; j < pos + length * 2; j += 2)
-			cairo_line_to(cairo, curves[j], curves[j + 1]);
+		if (curves[pos + 1] >= page_start && curves[pos + 1] <= page_end)
+			cairo_move_to(cairo, curves[pos], curves[pos + 1] - page_start);
+
+		for (unsigned int j = pos; j < pos + length * 2; j += 2) {
+			if (curves[j + 1] >= page_start && curves[j + 1] <= page_end)
+				cairo_line_to(cairo, curves[j], curves[j + 1] - page_start);
+		}
 
 		cairo_stroke(cairo);
 		pos += length * 2;
