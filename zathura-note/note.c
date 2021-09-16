@@ -95,7 +95,7 @@ static void plist_dump(plist_t plist, int depth)
 	} else if (PLIST_IS_DATA(plist)) {
 		unsigned long length;
 		const char *val = plist_get_data_ptr(plist, &length);
-		printf("<data length=\"%lu\">%.*s</data>\n", length, (int)length, val);
+		printf("<data length=\"%lu\">...</data>\n", length);
 	} else if (PLIST_IS_KEY(plist)) {
 		char *val;
 		plist_get_key_val(plist, &val);
@@ -207,6 +207,15 @@ static plist_t plist_handwriting_overlay(plist_t session_plist)
 	}
 
 	return overlay;
+}
+
+static const void *plist_dict_get_data(plist_t node, const char *name, unsigned long *length)
+{
+	plist_t data = plist_dict_get_item(node, name);
+	if (!PLIST_IS_DATA(data))
+		return 0;
+	const char *chars = plist_get_data_ptr(data, length);
+	return chars;
 }
 
 static float plist_page_width(plist_t session_plist)
@@ -342,35 +351,54 @@ GIRARA_HIDDEN zathura_error_t note_page_render_cairo(zathura_page_t *page, void 
 	if (printing)
 		return ZATHURA_ERROR_NOT_IMPLEMENTED;
 
-	float width = zathura_page_get_width(page);
-	float height = zathura_page_get_height(page);
-
 	note_document_t *note_document = zathura_document_get_data(zathura_page_get_document(page));
 	plist_t overlay = plist_handwriting_overlay(note_document->session_plist);
 	if (!overlay)
 		return ZATHURA_ERROR_NOT_IMPLEMENTED;
 
-	plist_t points_data = plist_dict_get_item(overlay, "curvespoints");
-	if (!PLIST_IS_DATA(points_data))
+	/* plist_dump(note_document->session_plist, 0); */
+	/* return ZATHURA_ERROR_OK; */
+
+	// Array of points on curve
+	unsigned long curves_length = 0;
+	const float *curves = plist_dict_get_data(overlay, "curvespoints", &curves_length);
+
+	// Specifies the number of points of a curve (using index of *curves)
+	unsigned long curves_num_length = 0;
+	const unsigned int *curves_num =
+		plist_dict_get_data(overlay, "curvesnumpoints", &curves_num_length);
+
+	// Width of curves
+	unsigned long curves_width_length = 0;
+	const float *curves_width =
+		plist_dict_get_data(overlay, "curveswidth", &curves_width_length);
+
+	// Colors of curves
+	unsigned long curves_colors_length = 0;
+	const char *curves_colors =
+		plist_dict_get_data(overlay, "curvescolors", &curves_colors_length);
+
+	// TODO: Fallback?
+	if (!curves || !curves_length || !curves_num || !curves_num_length || !curves_colors ||
+	    !curves_colors_length || !curves_width || !curves_width_length)
 		return ZATHURA_ERROR_NOT_IMPLEMENTED;
 
-	unsigned long points_length;
-	const char *points_chars = plist_get_data_ptr(points_data, &points_length);
-	if (!points_chars)
-		return ZATHURA_ERROR_NOT_IMPLEMENTED;
-	float *points = (float *)points_chars;
+	unsigned long limit = curves_num_length / sizeof(*curves_num);
+	unsigned int pos = 0;
+	for (unsigned long i = 0; i < limit; i++) {
+		const unsigned int length = curves_num[i];
+		const char *color = &curves_colors[i * 4];
+		cairo_set_source_rgba(cairo, color[0] & 0xff, color[1] & 0xff, color[2] & 0xff,
+				      (float)(color[3] & 0xff) / 255);
+		cairo_set_line_width(cairo, curves_width[i]);
+		cairo_move_to(cairo, curves[pos], curves[pos + 1]);
 
-	cairo_set_source_rgba(cairo, 0xff, 0, 0, 1);
-	cairo_set_line_width(cairo, 1);
-	for (unsigned long i = 0; i < points_length; i += 2) {
-		float x = points[i];
-		float y = points[i + 1];
-		if (x > width || y > height)
-			continue;
-		cairo_line_to(cairo, points[i], points[i + 1]);
+		for (unsigned int j = pos; j < pos + length * 2; j += 2)
+			cairo_line_to(cairo, curves[j], curves[j + 1]);
+
+		cairo_stroke(cairo);
+		pos += length * 2;
 	}
-	cairo_close_path(cairo);
-	cairo_stroke(cairo);
 
 	return ZATHURA_ERROR_OK;
 }
