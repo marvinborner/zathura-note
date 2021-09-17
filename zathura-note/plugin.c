@@ -1,6 +1,6 @@
 #include "plugin.h"
 
-ZATHURA_PLUGIN_REGISTER_WITH_FUNCTIONS("pdf-mupdf", VERSION_MAJOR, VERSION_MINOR, VERSION_REV,
+ZATHURA_PLUGIN_REGISTER_WITH_FUNCTIONS("note", VERSION_MAJOR, VERSION_MINOR, VERSION_REV,
 				       ZATHURA_PLUGIN_FUNCTIONS({
 					       .document_open = note_document_open,
 					       .document_free = note_document_free,
