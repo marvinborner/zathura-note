@@ -1,18 +1,58 @@
+// Copyright (c) 2021 Marvin Borner
+// WTFPL License (only for note.*)
+
+#include "cairo_jpg.h"
 #include "plugin.h"
 
 #include <plist/plist.h>
 #include <stdio.h>
 #include <zip.h>
 
+// Data struct for entire document
 typedef struct {
 	zip_t *zip;
 	plist_t objects;
+	char *root_name;
 	double width, height; // Page size is constant
 } note_document_t;
+
+// Data struct for single page
+typedef struct {
+	double start, end;
+	cairo_t *cairo;
+	zathura_page_t *page;
+} note_page_t;
 
 // Found by reverse engineering
 #define SESSION_OBJECTS_GENERAL_INFO 1
 #define SESSION_OBJECTS_LAYOUT_INFO 2
+
+static void zip_load(zip_t *zip, const char *root_name, const char *path, void **buf,
+		     size_t *length)
+{
+	char name[1024] = { 0 };
+	snprintf(name, sizeof(name), "%s/%s", root_name, path);
+	zip_stat_t stat;
+	zip_stat(zip, name, 0, &stat);
+	zip_file_t *file = zip_fopen(zip, name, 0);
+	if (!file) {
+		zip_error_t *err = zip_get_error(zip);
+		fprintf(stderr, "Couldn't find '%s' in zip: %s\n", name, zip_error_strerror(err));
+		*buf = 0;
+		*length = 0;
+		return;
+	}
+
+	*buf = malloc(stat.size);
+	*length = zip_fread(file, *buf, stat.size);
+	if (*length < stat.size) {
+		fprintf(stderr, "Unexpected size difference\n");
+		free(*buf);
+		*buf = 0;
+		*length = 0;
+		return;
+	}
+}
 
 // For debugging/reverse engineering
 #define INDENT 4
@@ -112,32 +152,17 @@ static void plist_dump(plist_t plist, int depth)
 static zathura_error_t plist_load(zip_t *zip, plist_t *plist, const char *root_name,
 				  const char *path)
 {
-	char name[1024] = { 0 };
-	snprintf(name, sizeof(name), "%s/%s", root_name, path);
-	zip_stat_t stat;
-	zip_stat(zip, name, 0, &stat);
-	zip_file_t *file = zip_fopen(zip, name, 0);
-	if (!file) {
-		zip_error_t *err = zip_get_error(zip);
-		fprintf(stderr, "Couldn't find '%s' in zip: %s\n", name, zip_error_strerror(err));
-		return ZATHURA_ERROR_INVALID_ARGUMENTS;
-	}
+	void *bin;
+	size_t length;
+	zip_load(zip, root_name, path, &bin, &length);
 
-	void *bin = malloc(stat.size);
-	size_t length = zip_fread(file, bin, stat.size);
-	if (length < stat.size) {
-		fprintf(stderr, "Unexpected size difference\n");
-		free(bin);
-		return ZATHURA_ERROR_INVALID_ARGUMENTS;
-	}
-
-	if (!plist_is_binary(bin, stat.size)) {
+	if (!plist_is_binary(bin, length)) {
 		fprintf(stderr, "Unexpected file format of '%s'\n", path);
 		free(bin);
 		return ZATHURA_ERROR_INVALID_ARGUMENTS;
 	}
 
-	plist_from_bin(bin, stat.size, plist);
+	plist_from_bin(bin, length, plist);
 	free(bin);
 	return ZATHURA_ERROR_OK;
 }
@@ -162,17 +187,23 @@ static plist_t plist_access(plist_t plist, int length, ...)
 	va_start(va, length);
 
 	unsigned long uid = 0;
-	const char **ptr;
+	const char **ptr, *dict_key;
 	plist_t current = plist;
-	int i;
+	int i, array_index;
 	for (i = 0; i < length && current; i++) {
 		plist_type type = plist_get_node_type(current);
 		switch (type) {
 		case PLIST_ARRAY:
-			current = plist_array_get_item(current, va_arg(va, int));
+			array_index = va_arg(va, int);
+			current = plist_array_get_item(current, array_index);
+			if (!current)
+				fprintf(stderr, "Couldn't find %d in array\n", array_index);
 			break;
 		case PLIST_DICT:
-			current = plist_dict_get_item(current, va_arg(va, const char *));
+			dict_key = va_arg(va, const char *);
+			current = plist_dict_get_item(current, dict_key);
+			if (!current)
+				fprintf(stderr, "Couldn't find '%s' in dict\n", dict_key);
 			break;
 		case PLIST_UID: // Automatic tracing!
 			plist_get_uid_val(current, &uid);
@@ -207,7 +238,7 @@ static plist_t plist_access(plist_t plist, int length, ...)
 			plist_get_real_val(current, va_arg(va, double *));
 			goto end;
 		default:
-			fprintf(stderr, "Fatal failure in access loop\n");
+			fprintf(stderr, "Unknown plist type in access loop\n");
 		}
 	}
 
@@ -225,7 +256,7 @@ end:
 
 	// TODO: Exit entire zathura in these conditions? Hmmm
 	if (!current)
-		fprintf(stderr, "Even more fatal failure in access loop\n");
+		fprintf(stderr, "Fatal failure in access loop\n");
 
 	return current;
 }
@@ -241,6 +272,14 @@ static plist_t plist_handwriting_overlay(plist_t objects)
 	}
 
 	return overlay;
+}
+
+// Converts the strange "{42.123, 69.123}" format to respective floats
+static void plist_string_to_floats(const char *string, float *a, float *b)
+{
+	char *end;
+	*a = strtof(string + 1, &end);
+	*b = strtof(end + 2, NULL);
 }
 
 // TODO: Find more elegant solution for page count (there doesn't seem to be)
@@ -335,11 +374,13 @@ GIRARA_HIDDEN zathura_error_t note_document_open(zathura_document_t *document)
 	note_document->objects = plist_dict_get_item(session_plist, "$objects");
 	if (!PLIST_IS_ARRAY(note_document->objects)) {
 		fprintf(stderr, "Invalid objects type\n");
+		free(note_document);
 		free(root_name);
 		return ZATHURA_ERROR_NOT_IMPLEMENTED;
 	}
 
 	note_document->zip = zip;
+	note_document->root_name = root_name;
 
 	note_document->width = plist_page_width(note_document->objects);
 	if (note_document->width < 1) {
@@ -352,17 +393,19 @@ GIRARA_HIDDEN zathura_error_t note_document_open(zathura_document_t *document)
 	zathura_document_set_number_of_pages(document, plist_page_count(note_document->objects,
 									note_document->height));
 
-	free(root_name);
 	return ZATHURA_ERROR_OK;
 }
 
 GIRARA_HIDDEN zathura_error_t note_document_free(zathura_document_t *document, void *data)
 {
+	(void)document;
+
 	if (!data)
 		return ZATHURA_ERROR_OK;
 
 	note_document_t *note_document = data;
 	zip_close(note_document->zip);
+	free(note_document->root_name);
 	return ZATHURA_ERROR_OK;
 }
 
@@ -372,24 +415,143 @@ GIRARA_HIDDEN zathura_error_t note_page_init(zathura_page_t *page)
 	zathura_page_set_width(page, note_document->width);
 	zathura_page_set_height(page, note_document->height);
 
+	double height = zathura_page_get_height(page);
+	unsigned int number = zathura_page_get_index(page);
+
+	note_page_t *note_page = malloc(sizeof(*note_page));
+	note_page->page = page;
+	note_page->start = height * number;
+	note_page->end = height * (number + 1);
+	zathura_page_set_data(page, note_page);
+
 	return ZATHURA_ERROR_OK;
 }
 
 GIRARA_HIDDEN zathura_error_t note_page_clear(zathura_page_t *page, void *data)
 {
+	(void)page;
+	free(data);
 	return ZATHURA_ERROR_OK;
 }
 
-static void note_page_render_object(cairo_t *cairo, plist_t objects, int index)
+typedef struct {
+	char *data;
+	size_t length;
+} cairo_read_closure;
+
+// Cairo is weird. Why can't we just pass a data buffer directly (like with cairo_jpg)?!
+static cairo_status_t cairo_read(void *data, unsigned char *buf, unsigned int length)
 {
+	cairo_read_closure *closure = data;
+
+	if (length > closure->length)
+		return CAIRO_STATUS_READ_ERROR;
+
+	memcpy(buf, closure->data, length);
+
+	closure->length -= length;
+	closure->data += length;
+
+	return CAIRO_STATUS_SUCCESS;
+}
+
+static cairo_surface_t *cairo_surface_scale(cairo_surface_t *surface, float width, float height)
+{
+	int unscaled_width = cairo_image_surface_get_width(surface);
+	int unscaled_height = cairo_image_surface_get_height(surface);
+	cairo_surface_t *result = cairo_surface_create_similar(
+		surface, cairo_surface_get_content(surface), width, height);
+	cairo_t *cairo = cairo_create(result);
+	cairo_scale(cairo, width / (float)unscaled_width, height / (float)unscaled_height);
+	cairo_set_source_surface(cairo, surface, 0, 0);
+	cairo_set_operator(cairo, CAIRO_OPERATOR_SOURCE);
+	cairo_paint(cairo);
+	cairo_destroy(cairo);
+	return result;
+}
+
+static void note_page_render_image_object(note_page_t *page, plist_t objects, int index)
+{
+	char missing = 0;
+	plist_access(objects, 6, index, "figure", "FigureBackgroundObjectKey",
+		     "kImageObjectSnapshotKey", "imageIsMissing", &missing);
+	if (missing)
+		return;
+
 	char *position = 0;
 	size_t position_length = 0;
 	plist_access(objects, 4, index, "documentContentOrigin", &position, &position_length);
-	printf("%.*s\n", (int)position_length, position);
+	float x, y;
+	plist_string_to_floats(position, &x, &y);
+
+	char *size = 0;
+	size_t size_length = 0;
+	plist_access(objects, 4, index, "unscaledContentSize", &size, &size_length);
+	float width, height;
+	plist_string_to_floats(size, &width, &height);
+
+	if (y < page->start || y + height > page->end)
+		return;
+
+	char *path = 0;
+	size_t path_length = 0;
+	plist_access(objects, 7, index, "figure", "FigureBackgroundObjectKey",
+		     "kImageObjectSnapshotKey", "relativePath", &path, &path_length);
+
+	char is_jpeg = 0; // 0 means png
+	plist_access(objects, 6, index, "figure", "FigureBackgroundObjectKey",
+		     "kImageObjectSnapshotKey", "saveAsJPEG", &is_jpeg);
+
+	note_document_t *note_document =
+		zathura_document_get_data(zathura_page_get_document(page->page));
+	zip_t *zip = note_document->zip;
+	void *data;
+	size_t length;
+	zip_load(zip, note_document->root_name, path, &data, &length);
+	if (!data || !length) {
+		fprintf(stderr, "Invalid media object '%s' in zip\n", path);
+		return;
+	}
+
+	cairo_surface_t *surface = 0;
+	if (is_jpeg) {
+		surface = cairo_image_surface_create_from_jpeg_mem(data, length);
+	} else {
+		cairo_read_closure closure = { .data = data, .length = length };
+		surface = cairo_image_surface_create_from_png_stream(cairo_read, &closure);
+	}
+
+	if (!surface || cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
+		fprintf(stderr, "Invalid surface from png stream\n");
+		return;
+	}
+
+	surface = cairo_surface_scale(surface, width, height);
+
+	cairo_set_source_surface(page->cairo, surface, x, y - page->start);
+	cairo_paint(page->cairo);
+	cairo_surface_flush(surface);
+	cairo_surface_destroy(surface);
+}
+
+static void note_page_render_object(note_page_t *page, plist_t objects, int index)
+{
+	char *class = 0;
+	size_t class_length = 0;
+	plist_access(objects, 5, index, "$class", "$classname", &class, &class_length);
+
+	if (!memcmp(class, "ImageMediaObject", class_length)) {
+		note_page_render_image_object(page, objects, index);
+	} else if (!memcmp(class, "TextBlockMediaObject", class_length)) {
+		// TODO
+	} else {
+		fprintf(stderr, "Unknown media object type '%.*s', please report\n",
+			(int)class_length, class);
+	}
 }
 
 // It doesn't really matter if something in here fails
-static void note_page_render_objects(cairo_t *cairo, plist_t objects)
+static void note_page_render_objects(note_page_t *page, plist_t objects)
 {
 	plist_t objects_array =
 		plist_access(objects, 3, SESSION_OBJECTS_LAYOUT_INFO, "mediaObjects", "NS.objects");
@@ -404,7 +566,7 @@ static void note_page_render_objects(cairo_t *cairo, plist_t objects)
 
 		size_t index;
 		plist_get_uid_val(val, &index);
-		note_page_render_object(cairo, objects, index);
+		note_page_render_object(page, objects, index);
 	}
 }
 
@@ -415,6 +577,9 @@ GIRARA_HIDDEN zathura_error_t note_page_render_cairo(zathura_page_t *page, void 
 		return ZATHURA_ERROR_NOT_IMPLEMENTED;
 
 	note_document_t *note_document = zathura_document_get_data(zathura_page_get_document(page));
+	note_page_t *note_page = data;
+	note_page->cairo = cairo;
+
 	plist_t overlay = plist_handwriting_overlay(note_document->objects);
 	if (!overlay)
 		return ZATHURA_ERROR_NOT_IMPLEMENTED;
@@ -422,13 +587,8 @@ GIRARA_HIDDEN zathura_error_t note_page_render_cairo(zathura_page_t *page, void 
 	/* plist_dump(note_document->session_plist, 0); */
 	/* return ZATHURA_ERROR_OK; */
 
-	double height = zathura_page_get_height(page);
-	unsigned int number = zathura_page_get_index(page);
-	double page_start = height * number;
-	double page_end = height * (number + 1);
-
 	// Render all media objects (images, ...)
-	note_page_render_objects(cairo, note_document->objects);
+	note_page_render_objects(note_page, note_document->objects);
 
 	// Array of points on curve
 	size_t curves_length = 0;
@@ -463,15 +623,17 @@ GIRARA_HIDDEN zathura_error_t note_page_render_cairo(zathura_page_t *page, void 
 				      (float)(color[1] & 0xff) / 255,
 				      (float)(color[2] & 0xff) / 255,
 				      (float)(color[3] & 0xff) / 255);
+
+		// TODO: Fractional curve widths (?)
 		cairo_set_line_width(cairo, curves_width[i]);
 
-		if (curves[pos + 1] >= page_start && curves[pos + 1] <= page_end)
-			cairo_move_to(cairo, curves[pos], curves[pos + 1] - page_start);
+		if (curves[pos + 1] >= note_page->start && curves[pos + 1] <= note_page->end)
+			cairo_move_to(cairo, curves[pos], curves[pos + 1] - note_page->start);
 
 		// TODO: Render as bezier curves
 		for (unsigned int j = pos; j < pos + length * 2; j += 2)
-			if (curves[j + 1] >= page_start && curves[j + 1] <= page_end)
-				cairo_line_to(cairo, curves[j], curves[j + 1] - page_start);
+			if (curves[j + 1] >= note_page->start && curves[j + 1] <= note_page->end)
+				cairo_line_to(cairo, curves[j], curves[j + 1] - note_page->start);
 
 		cairo_stroke(cairo);
 		pos += length * 2;
