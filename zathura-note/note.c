@@ -330,7 +330,7 @@ static float plist_page_ratio(plist_t objects)
 
 static float plist_page_width(plist_t objects)
 {
-	char *class = 0;
+	const char *class = 0;
 	size_t class_length = 0;
 	plist_access(objects, 6, SESSION_OBJECTS_GLOBAL_TEXT_STORE, "reflowState", "$class",
 		     "$classname", &class, &class_length);
@@ -339,7 +339,7 @@ static float plist_page_width(plist_t objects)
 
 	if (!memcmp(class, "NBReflowStateReflowable", class_length)) {
 		fprintf(stderr,
-			"Warning: This document is reflowable, which isn't really supported right now. You can lock the reflow state by drawing some lines onto the document (I think)\n");
+			"Warning: The global text store is reflowable, which isn't really supported right now. You can lock the reflow state by drawing some lines onto the document (I think)\n");
 	} else if (!memcmp(class, "NBReflowStateLocked", class_length)) { // That's how I like it
 		plist_access(objects, 4, SESSION_OBJECTS_GLOBAL_TEXT_STORE, "reflowState",
 			     "pageWidthInDocumentCoordsKey", &val);
@@ -547,21 +547,25 @@ GIRARA_HIDDEN zathura_error_t note_page_clear(zathura_page_t *page, void *data)
 	return ZATHURA_ERROR_OK;
 }
 
-static void note_page_render_image_object(note_page_t *page, plist_t objects, int index)
+static void note_page_render_image_object(note_page_t *page, int index)
 {
+	note_document_t *note_document =
+		zathura_document_get_data(zathura_page_get_document(page->page));
+	plist_t objects = note_document->objects;
+
 	char missing = 0;
 	plist_access(objects, 6, index, "figure", "FigureBackgroundObjectKey",
 		     "kImageObjectSnapshotKey", "imageIsMissing", &missing);
 	if (missing)
 		return;
 
-	char *position = 0;
+	const char *position = 0;
 	size_t position_length = 0;
 	plist_access(objects, 4, index, "documentContentOrigin", &position, &position_length);
 	float x, y;
 	plist_string_to_floats(position, &x, &y);
 
-	char *size = 0;
+	const char *size = 0;
 	size_t size_length = 0;
 	plist_access(objects, 4, index, "unscaledContentSize", &size, &size_length);
 	float width, height;
@@ -570,7 +574,7 @@ static void note_page_render_image_object(note_page_t *page, plist_t objects, in
 	if (y < page->start || y + height > page->end)
 		return;
 
-	char *path = 0;
+	const char *path = 0;
 	size_t path_length = 0;
 	plist_access(objects, 7, index, "figure", "FigureBackgroundObjectKey",
 		     "kImageObjectSnapshotKey", "relativePath", &path, &path_length);
@@ -579,8 +583,6 @@ static void note_page_render_image_object(note_page_t *page, plist_t objects, in
 	plist_access(objects, 6, index, "figure", "FigureBackgroundObjectKey",
 		     "kImageObjectSnapshotKey", "saveAsJPEG", &is_jpeg);
 
-	note_document_t *note_document =
-		zathura_document_get_data(zathura_page_get_document(page->page));
 	zip_t *zip = note_document->zip;
 	void *data;
 	size_t length;
@@ -611,42 +613,202 @@ static void note_page_render_image_object(note_page_t *page, plist_t objects, in
 	cairo_surface_destroy(surface);
 }
 
-static void note_page_render_text_store(note_page_t *page, plist_t objects, int index, float x,
-					float y, float width, float height)
+static void note_page_render_text_range_extract_range(plist_t objects, int range, int *start,
+						      int *end)
 {
-	char *keys[2] = { 0 };
-	size_t key_length[2] = { 0 };
-	plist_access(objects, 6, index, "attributedString", "NS.keys", 0, &keys[0], &key_length[0]);
-	plist_access(objects, 6, index, "attributedString", "NS.keys", 1, &keys[1], &key_length[1]);
-
-	int text_index = 0;
-	if (!memcmp(keys[0], "stringKey", key_length[0])) {
-		text_index = 0;
-	} else if (!memcmp(keys[1], "stringKey", key_length[1])) {
-		text_index = 1;
-	} else {
-		fprintf(stderr, "Missing string key in text store, please report\n");
-		return;
-	}
-
-	char *text = 0;
-	size_t text_length = 0;
-	plist_access(objects, 6, index, "attributedString", "NS.objects", text_index, &text,
-		     &text_length);
-
-	cairo_move_to(page->cairo, x, y - page->start);
-	cairo_show_text(page->cairo, text);
+	const char *range_string = 0;
+	size_t range_length = 0;
+	plist_access(objects, 3, range, &range_string, &range_length);
+	float start_float, end_float;
+	plist_string_to_floats(range_string, &start_float, &end_float);
+	*start = (int)start_float;
+	*end = *start + (int)end_float;
 }
 
-static void note_page_render_text_object(note_page_t *page, plist_t objects, int index)
+static void note_page_render_text_range_extract_font(plist_t objects, int font,
+						     const char **font_name, int *font_size)
 {
-	char *position = 0;
+	double floating_font_size = 0;
+	plist_t font_keys = plist_access(objects, 2, font, "NS.keys");
+	plist_array_iter font_iter;
+	plist_array_new_iter(font_keys, &font_iter);
+	int font_index = 0;
+	while (1) {
+		plist_t key_ptr;
+		plist_array_next_item(font_keys, font_iter, &key_ptr);
+		if (!key_ptr)
+			break;
+
+		size_t key_index;
+		plist_get_uid_val(key_ptr, &key_index);
+
+		const char *key = 0;
+		size_t key_length = 0;
+		plist_access(objects, 3, key_index, &key, &key_length);
+		if (!key)
+			continue;
+
+		if (!memcmp(key, "NSFontSizeAttribute", key_length)) {
+			plist_access(objects, 4, font, "NS.objects", font_index,
+				     &floating_font_size);
+		} else if (!memcmp(key, "NSFontNameAttribute", key_length)) {
+			size_t font_length; // idc, is 0-delimited anyways (I hope)
+			plist_access(objects, 5, font, "NS.objects", font_index, font_name,
+				     &font_length);
+		} else {
+			fprintf(stderr, "Unknown font attribute '%.*s', please report\n",
+				(int)key_length, key);
+		}
+
+		font_index++;
+	}
+
+	*font_size = (int)floating_font_size;
+}
+
+static void note_page_render_text_range_extract_color(plist_t objects, int color, double *red,
+						      double *green, double *blue, double *alpha)
+{
+	plist_access(objects, 3, color, "UIRed", red);
+	plist_access(objects, 3, color, "UIGreen", green);
+	plist_access(objects, 3, color, "UIBlue", blue);
+	plist_access(objects, 3, color, "UIAlpha", alpha);
+}
+
+static int note_page_render_text_sub_range(note_page_t *page, const char *data, int range, int font,
+					   int other_attributes, int color, float x, float y)
+{
+	note_document_t *note_document =
+		zathura_document_get_data(zathura_page_get_document(page->page));
+	plist_t objects = note_document->objects;
+
+	int start, end;
+	note_page_render_text_range_extract_range(objects, range, &start, &end);
+
+	const char *font_name = 0;
+	int font_size = 0;
+	note_page_render_text_range_extract_font(objects, font, &font_name, &font_size);
+
+	// TODO: Extract line-spacing, boldness, underline, etc. from other_attributes
+	(void)other_attributes;
+
+	double red, green, blue, alpha;
+	note_page_render_text_range_extract_color(objects, color, &red, &green, &blue, &alpha);
+
+	PangoFontDescription *description = pango_font_description_new();
+	pango_font_description_set_absolute_size(description, font_size * PANGO_SCALE); // TODO: ?
+	pango_font_description_set_family_static(description, font_name);
+
+	PangoLayout *layout = pango_cairo_create_layout(page->cairo);
+	pango_layout_set_font_description(layout, description);
+	pango_layout_set_text(layout, data + start, end - start);
+
+	cairo_move_to(page->cairo, x, y - page->start + font_size / 2);
+	cairo_set_source_rgb(page->cairo, red, green, blue);
+	pango_cairo_show_layout(page->cairo, layout);
+
+	int height = pango_layout_get_line_count(layout) * font_size;
+
+	pango_font_description_free(description);
+	g_object_unref(layout);
+
+	return height;
+}
+
+static void note_page_render_text_store(note_page_t *page, int index, float x, float y, float width,
+					float height)
+{
+	note_document_t *note_document =
+		zathura_document_get_data(zathura_page_get_document(page->page));
+	plist_t objects = note_document->objects;
+
+	const char *data = 0;
+	size_t data_length = 0;
+	plist_access(objects, 8, index, "NBAttributedBackingString", // TODO: Don't assume 0/1?
+		     "NBAttributedBackingStringCodingKey", "NS.objects", 0, "NS.bytes", &data,
+		     &data_length);
+	if (!data || !data_length)
+		return;
+
+	plist_t array =
+		plist_access(objects, 6, index, "NBAttributedBackingString",
+			     "NBAttributedBackingStringCodingKey", "NS.objects", 1, "NS.objects");
+	if (!PLIST_IS_ARRAY(array))
+		return;
+
+	plist_array_iter iter;
+	plist_array_new_iter(array, &iter);
+	while (1) {
+		plist_t val;
+		plist_array_next_item(array, iter, &val);
+		if (!val)
+			break;
+
+		size_t elem_index;
+		plist_get_uid_val(val, &elem_index);
+
+		plist_t keys = plist_access(objects, 2, elem_index, "NS.keys");
+		if (!PLIST_IS_ARRAY(keys))
+			continue;
+
+		int color_cross_platform, range, font, other_attributes, color;
+
+		int index = 0;
+		plist_array_iter key_iter;
+		plist_array_new_iter(keys, &key_iter);
+		while (1) {
+			plist_t key_ptr;
+			plist_array_next_item(keys, key_iter, &key_ptr);
+			if (!key_ptr)
+				break;
+
+			size_t key_index;
+			plist_get_uid_val(key_ptr, &key_index);
+
+			const char *key = 0;
+			size_t key_length = 0;
+			plist_access(objects, 3, key_index, &key, &key_length);
+			if (!key)
+				continue;
+
+			plist_t object =
+				plist_access(objects, 3, elem_index, "NS.objects", index++);
+			int object_index = plist_array_get_item_index(object);
+
+			if (!memcmp(key, "subRangeColorCrossPlatformKey", key_length))
+				continue; // Seems irrelevant (always like "0.0,0.0,0.0,1.0")
+			else if (!memcmp(key, "subRangeRangeKey", key_length))
+				range = object_index;
+			else if (!memcmp(key, "subRangeFontKey", key_length))
+				font = object_index;
+			else if (!memcmp(key, "subRangeOtherAttributesKey", key_length))
+				other_attributes = object_index;
+			else if (!memcmp(key, "subRangeColorKey", key_length))
+				color = object_index;
+			else
+				fprintf(stderr,
+					"Unknown text sub range key '%.*s', please report\n",
+					(int)key_length, key);
+		}
+
+		y += note_page_render_text_sub_range(page, data, range, font, other_attributes,
+						     color, x, y);
+	}
+}
+
+static void note_page_render_text_object(note_page_t *page, int index)
+{
+	note_document_t *note_document =
+		zathura_document_get_data(zathura_page_get_document(page->page));
+	plist_t objects = note_document->objects;
+
+	const char *position = 0;
 	size_t position_length = 0;
 	plist_access(objects, 4, index, "documentContentOrigin", &position, &position_length);
 	float x, y;
 	plist_string_to_floats(position, &x, &y);
 
-	char *size = 0;
+	const char *size = 0;
 	size_t size_length = 0;
 	plist_access(objects, 4, index, "unscaledContentSize", &size, &size_length);
 	float width, height;
@@ -657,20 +819,24 @@ static void note_page_render_text_object(note_page_t *page, plist_t objects, int
 
 	plist_t text_store = plist_access(objects, 2, index, "textStore");
 
-	note_page_render_text_store(page, objects, plist_array_get_item_index(text_store), x, y,
-				    width, height);
+	note_page_render_text_store(page, plist_array_get_item_index(text_store), x, y, width,
+				    height);
 }
 
-static void note_page_render_object(note_page_t *page, plist_t objects, int index)
+static void note_page_render_object(note_page_t *page, int index)
 {
-	char *class = 0;
+	note_document_t *note_document =
+		zathura_document_get_data(zathura_page_get_document(page->page));
+	plist_t objects = note_document->objects;
+
+	const char *class = 0;
 	size_t class_length = 0;
 	plist_access(objects, 5, index, "$class", "$classname", &class, &class_length);
 
 	if (!memcmp(class, "ImageMediaObject", class_length)) {
-		note_page_render_image_object(page, objects, index);
+		note_page_render_image_object(page, index);
 	} else if (!memcmp(class, "TextBlockMediaObject", class_length)) {
-		note_page_render_text_object(page, objects, index);
+		note_page_render_text_object(page, index);
 	} else {
 		fprintf(stderr, "Unknown media object type '%.*s', please report\n",
 			(int)class_length, class);
@@ -678,11 +844,16 @@ static void note_page_render_object(note_page_t *page, plist_t objects, int inde
 }
 
 // It doesn't really matter if something in here fails
-static void note_page_render_objects(note_page_t *page, plist_t objects)
+static void note_page_render_objects(note_page_t *page)
 {
+	note_document_t *note_document =
+		zathura_document_get_data(zathura_page_get_document(page->page));
+	plist_t objects = note_document->objects;
+
 	// Render the global text object
-	note_page_render_text_store(page, objects, SESSION_OBJECTS_GLOBAL_TEXT_STORE, 0, 0,
-				    zathura_page_get_width(page), zathura_page_get_height(page));
+	note_page_render_text_store(page, SESSION_OBJECTS_GLOBAL_TEXT_STORE, 0, 0,
+				    zathura_page_get_width(page->page),
+				    zathura_page_get_height(page->page));
 
 	plist_t objects_array = plist_access(objects, 3, SESSION_OBJECTS_GLOBAL_TEXT_STORE,
 					     "mediaObjects", "NS.objects");
@@ -697,7 +868,7 @@ static void note_page_render_objects(note_page_t *page, plist_t objects)
 
 		size_t index;
 		plist_get_uid_val(val, &index);
-		note_page_render_object(page, objects, index);
+		note_page_render_object(page, index);
 	}
 }
 
@@ -712,7 +883,7 @@ GIRARA_HIDDEN zathura_error_t note_page_render_cairo(zathura_page_t *page, void 
 	note_page->cairo = cairo;
 
 	// Render all media objects (images, ...)
-	note_page_render_objects(note_page, note_document->objects);
+	note_page_render_objects(note_page);
 
 	plist_t overlay = plist_handwriting_overlay(note_document->objects);
 	if (!overlay)
