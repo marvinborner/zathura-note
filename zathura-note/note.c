@@ -1,5 +1,4 @@
 // Copyright (c) 2021 Marvin Borner
-// WTFPL License (only for note.*)
 
 #include "plugin.h"
 
@@ -26,7 +25,7 @@ typedef struct {
 
 // Found by reverse engineering
 #define SESSION_OBJECTS_GENERAL_INFO 1
-#define SESSION_OBJECTS_LAYOUT_INFO 2
+#define SESSION_OBJECTS_GLOBAL_TEXT_STORE 2
 
 /**
  * Zip wrappers/utilities
@@ -165,7 +164,7 @@ static zathura_error_t plist_load(zip_t *zip, plist_t *plist, const char *root_n
 	size_t length;
 	zip_load(zip, root_name, path, &bin, &length);
 
-	if (!plist_is_binary(bin, length)) {
+	if (!bin || !length || !plist_is_binary(bin, length)) {
 		fprintf(stderr, "Unexpected file format of '%s'\n", path);
 		free(bin);
 		return ZATHURA_ERROR_INVALID_ARGUMENTS;
@@ -272,7 +271,7 @@ end:
 
 static plist_t plist_handwriting_overlay(plist_t objects)
 {
-	plist_t overlay = plist_access(objects, 3, SESSION_OBJECTS_LAYOUT_INFO,
+	plist_t overlay = plist_access(objects, 3, SESSION_OBJECTS_GLOBAL_TEXT_STORE,
 				       "Handwriting Overlay", "SpatialHash");
 
 	if (!PLIST_IS_DICT(overlay)) {
@@ -296,8 +295,8 @@ static int plist_page_count(plist_t objects, double page_height)
 {
 	const float *curves = 0;
 	size_t curves_length = 0;
-	plist_access(objects, 6, SESSION_OBJECTS_LAYOUT_INFO, "Handwriting Overlay", "SpatialHash",
-		     "curvespoints", &curves, &curves_length);
+	plist_access(objects, 6, SESSION_OBJECTS_GLOBAL_TEXT_STORE, "Handwriting Overlay",
+		     "SpatialHash", "curvespoints", &curves, &curves_length);
 
 	// Find highest y curve-point
 	double max = 0;
@@ -310,7 +309,7 @@ static int plist_page_count(plist_t objects, double page_height)
 
 static float plist_page_ratio(plist_t objects)
 {
-	float ratio = 1.414; // DIN ratio because why not
+	float ratio = 1.414; // Default is DIN ratio because why not
 
 	const char *type;
 	size_t type_length = 0;
@@ -331,9 +330,22 @@ static float plist_page_ratio(plist_t objects)
 
 static float plist_page_width(plist_t objects)
 {
-	double val;
-	plist_access(objects, 4, SESSION_OBJECTS_LAYOUT_INFO, "reflowState",
-		     "pageWidthInDocumentCoordsKey", &val);
+	char *class = 0;
+	size_t class_length = 0;
+	plist_access(objects, 6, SESSION_OBJECTS_GLOBAL_TEXT_STORE, "reflowState", "$class",
+		     "$classname", &class, &class_length);
+
+	double val = 500; // Default width if something fails or it's not specified
+
+	if (!memcmp(class, "NBReflowStateReflowable", class_length)) {
+		fprintf(stderr,
+			"Warning: This document is reflowable, which isn't really supported right now. You can lock the reflow state by drawing some lines onto the document (I think)\n");
+	} else if (!memcmp(class, "NBReflowStateLocked", class_length)) { // That's how I like it
+		plist_access(objects, 4, SESSION_OBJECTS_GLOBAL_TEXT_STORE, "reflowState",
+			     "pageWidthInDocumentCoordsKey", &val);
+	} else {
+		fprintf(stderr, "Unknown reflow state '%s', please report\n", class);
+	}
 
 	return val;
 }
@@ -599,6 +611,56 @@ static void note_page_render_image_object(note_page_t *page, plist_t objects, in
 	cairo_surface_destroy(surface);
 }
 
+static void note_page_render_text_store(note_page_t *page, plist_t objects, int index, float x,
+					float y, float width, float height)
+{
+	char *keys[2] = { 0 };
+	size_t key_length[2] = { 0 };
+	plist_access(objects, 6, index, "attributedString", "NS.keys", 0, &keys[0], &key_length[0]);
+	plist_access(objects, 6, index, "attributedString", "NS.keys", 1, &keys[1], &key_length[1]);
+
+	int text_index = 0;
+	if (!memcmp(keys[0], "stringKey", key_length[0])) {
+		text_index = 0;
+	} else if (!memcmp(keys[1], "stringKey", key_length[1])) {
+		text_index = 1;
+	} else {
+		fprintf(stderr, "Missing string key in text store, please report\n");
+		return;
+	}
+
+	char *text = 0;
+	size_t text_length = 0;
+	plist_access(objects, 6, index, "attributedString", "NS.objects", text_index, &text,
+		     &text_length);
+
+	cairo_move_to(page->cairo, x, y - page->start);
+	cairo_show_text(page->cairo, text);
+}
+
+static void note_page_render_text_object(note_page_t *page, plist_t objects, int index)
+{
+	char *position = 0;
+	size_t position_length = 0;
+	plist_access(objects, 4, index, "documentContentOrigin", &position, &position_length);
+	float x, y;
+	plist_string_to_floats(position, &x, &y);
+
+	char *size = 0;
+	size_t size_length = 0;
+	plist_access(objects, 4, index, "unscaledContentSize", &size, &size_length);
+	float width, height;
+	plist_string_to_floats(size, &width, &height);
+
+	if (y < page->start || y + height > page->end)
+		return;
+
+	plist_t text_store = plist_access(objects, 2, index, "textStore");
+
+	note_page_render_text_store(page, objects, plist_array_get_item_index(text_store), x, y,
+				    width, height);
+}
+
 static void note_page_render_object(note_page_t *page, plist_t objects, int index)
 {
 	char *class = 0;
@@ -608,7 +670,7 @@ static void note_page_render_object(note_page_t *page, plist_t objects, int inde
 	if (!memcmp(class, "ImageMediaObject", class_length)) {
 		note_page_render_image_object(page, objects, index);
 	} else if (!memcmp(class, "TextBlockMediaObject", class_length)) {
-		// TODO
+		note_page_render_text_object(page, objects, index);
 	} else {
 		fprintf(stderr, "Unknown media object type '%.*s', please report\n",
 			(int)class_length, class);
@@ -618,8 +680,12 @@ static void note_page_render_object(note_page_t *page, plist_t objects, int inde
 // It doesn't really matter if something in here fails
 static void note_page_render_objects(note_page_t *page, plist_t objects)
 {
-	plist_t objects_array =
-		plist_access(objects, 3, SESSION_OBJECTS_LAYOUT_INFO, "mediaObjects", "NS.objects");
+	// Render the global text object
+	note_page_render_text_store(page, objects, SESSION_OBJECTS_GLOBAL_TEXT_STORE, 0, 0,
+				    zathura_page_get_width(page), zathura_page_get_height(page));
+
+	plist_t objects_array = plist_access(objects, 3, SESSION_OBJECTS_GLOBAL_TEXT_STORE,
+					     "mediaObjects", "NS.objects");
 
 	plist_array_iter iter;
 	plist_array_new_iter(objects_array, &iter);
@@ -645,15 +711,15 @@ GIRARA_HIDDEN zathura_error_t note_page_render_cairo(zathura_page_t *page, void 
 	note_page_t *note_page = data;
 	note_page->cairo = cairo;
 
-	plist_t overlay = plist_handwriting_overlay(note_document->objects);
-	if (!overlay)
-		return ZATHURA_ERROR_NOT_IMPLEMENTED;
-
-	/* plist_dump(note_document->session_plist, 0); */
-	/* return ZATHURA_ERROR_OK; */
-
 	// Render all media objects (images, ...)
 	note_page_render_objects(note_page, note_document->objects);
+
+	plist_t overlay = plist_handwriting_overlay(note_document->objects);
+	if (!overlay)
+		return ZATHURA_ERROR_OK;
+
+	/* plist_dump(note_document->objects, 0); */
+	/* return ZATHURA_ERROR_OK; */
 
 	// Array of points on curve
 	size_t curves_length = 0;
@@ -674,10 +740,9 @@ GIRARA_HIDDEN zathura_error_t note_page_render_cairo(zathura_page_t *page, void 
 	const char *curves_colors =
 		plist_dict_get_data(overlay, "curvescolors", &curves_colors_length);
 
-	// TODO: Fallback?
 	if (!curves || !curves_length || !curves_num || !curves_num_length || !curves_colors ||
 	    !curves_colors_length || !curves_width || !curves_width_length)
-		return ZATHURA_ERROR_NOT_IMPLEMENTED;
+		return ZATHURA_ERROR_OK; // Arrays are empty if no lines have been drawn - that's okay!
 
 	size_t limit = curves_num_length / sizeof(*curves_num);
 	unsigned int pos = 0;
