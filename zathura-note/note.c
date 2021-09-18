@@ -1,12 +1,13 @@
 // Copyright (c) 2021 Marvin Borner
 // WTFPL License (only for note.*)
 
-#include "cairo_jpg.h"
 #include "plugin.h"
 
 #include <plist/plist.h>
 #include <stdio.h>
 #include <zip.h>
+
+#include <jpeglib.h>
 
 // Data struct for entire document
 typedef struct {
@@ -26,6 +27,10 @@ typedef struct {
 // Found by reverse engineering
 #define SESSION_OBJECTS_GENERAL_INFO 1
 #define SESSION_OBJECTS_LAYOUT_INFO 2
+
+/**
+ * Zip wrappers/utilities
+ */
 
 static void zip_load(zip_t *zip, const char *root_name, const char *path, void **buf,
 		     size_t *length)
@@ -53,6 +58,10 @@ static void zip_load(zip_t *zip, const char *root_name, const char *path, void *
 		return;
 	}
 }
+
+/**
+ * Plist wrappers/utilities
+ */
 
 // For debugging/reverse engineering
 #define INDENT 4
@@ -329,6 +338,98 @@ static float plist_page_width(plist_t objects)
 	return val;
 }
 
+/**
+ * Cairo wrappers/utilities
+ */
+
+typedef struct {
+	char *data;
+	size_t length;
+} cairo_read_closure;
+
+// Cairo is weird. Why can't we just pass a data buffer directly?
+static cairo_status_t cairo_read(void *data, unsigned char *buf, unsigned int length)
+{
+	cairo_read_closure *closure = data;
+
+	if (length > closure->length)
+		return CAIRO_STATUS_READ_ERROR;
+
+	memcpy(buf, closure->data, length);
+
+	closure->length -= length;
+	closure->data += length;
+
+	return CAIRO_STATUS_SUCCESS;
+}
+
+static cairo_surface_t *cairo_surface_scale(cairo_surface_t *surface, float width, float height)
+{
+	int unscaled_width = cairo_image_surface_get_width(surface);
+	int unscaled_height = cairo_image_surface_get_height(surface);
+	cairo_surface_t *result = cairo_surface_create_similar(
+		surface, cairo_surface_get_content(surface), width, height);
+	cairo_t *cairo = cairo_create(result);
+	cairo_scale(cairo, width / (float)unscaled_width, height / (float)unscaled_height);
+	cairo_set_source_surface(cairo, surface, 0, 0);
+	cairo_set_operator(cairo, CAIRO_OPERATOR_SOURCE);
+	cairo_paint(cairo);
+	cairo_destroy(cairo);
+	return result;
+}
+
+cairo_surface_t *cairo_image_surface_create_from_jpeg_mem(void *data, size_t len)
+{
+	struct jpeg_decompress_struct jpeg;
+	struct jpeg_error_mgr jpeg_err;
+	jpeg.err = jpeg_std_error(&jpeg_err);
+	jpeg_create_decompress(&jpeg);
+	jpeg_mem_src(&jpeg, data, len);
+	jpeg_read_header(&jpeg, TRUE);
+
+#ifdef LIBJPEG_TURBO_VERSION
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+	jpeg.out_color_space = JCS_EXT_BGRA;
+#else
+	jpeg.out_color_space = JCS_EXT_ARGB;
+#endif
+#else
+	jpeg.out_color_space = JCS_RGB;
+#endif
+
+	jpeg_start_decompress(&jpeg);
+
+	cairo_surface_t *surface = cairo_image_surface_create(CAIRO_FORMAT_RGB24, jpeg.output_width,
+							      jpeg.output_height);
+	if (cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
+		jpeg_destroy_decompress(&jpeg);
+		return surface;
+	}
+
+	while (jpeg.output_scanline < jpeg.output_height) {
+		unsigned char *row_address =
+			cairo_image_surface_get_data(surface) +
+			(jpeg.output_scanline * cairo_image_surface_get_stride(surface));
+		JSAMPROW row_pointer = row_address;
+		jpeg_read_scanlines(&jpeg, &row_pointer, 1);
+#ifndef LIBJPEG_TURBO_VERSION
+		pix_conv(row_address, 4, row_address, 3, jpeg.output_width);
+#endif
+	}
+
+	cairo_surface_mark_dirty(surface);
+	jpeg_finish_decompress(&jpeg);
+	jpeg_destroy_decompress(&jpeg);
+
+	cairo_surface_set_mime_data(surface, CAIRO_MIME_TYPE_JPEG, data, len, free, data);
+
+	return surface;
+}
+
+/**
+ * Main zathura plugin implementations
+ */
+
 GIRARA_HIDDEN zathura_error_t note_document_open(zathura_document_t *document)
 {
 	zathura_error_t error = ZATHURA_ERROR_OK;
@@ -432,42 +533,6 @@ GIRARA_HIDDEN zathura_error_t note_page_clear(zathura_page_t *page, void *data)
 	(void)page;
 	free(data);
 	return ZATHURA_ERROR_OK;
-}
-
-typedef struct {
-	char *data;
-	size_t length;
-} cairo_read_closure;
-
-// Cairo is weird. Why can't we just pass a data buffer directly (like with cairo_jpg)?!
-static cairo_status_t cairo_read(void *data, unsigned char *buf, unsigned int length)
-{
-	cairo_read_closure *closure = data;
-
-	if (length > closure->length)
-		return CAIRO_STATUS_READ_ERROR;
-
-	memcpy(buf, closure->data, length);
-
-	closure->length -= length;
-	closure->data += length;
-
-	return CAIRO_STATUS_SUCCESS;
-}
-
-static cairo_surface_t *cairo_surface_scale(cairo_surface_t *surface, float width, float height)
-{
-	int unscaled_width = cairo_image_surface_get_width(surface);
-	int unscaled_height = cairo_image_surface_get_height(surface);
-	cairo_surface_t *result = cairo_surface_create_similar(
-		surface, cairo_surface_get_content(surface), width, height);
-	cairo_t *cairo = cairo_create(result);
-	cairo_scale(cairo, width / (float)unscaled_width, height / (float)unscaled_height);
-	cairo_set_source_surface(cairo, surface, 0, 0);
-	cairo_set_operator(cairo, CAIRO_OPERATOR_SOURCE);
-	cairo_paint(cairo);
-	cairo_destroy(cairo);
-	return result;
 }
 
 static void note_page_render_image_object(note_page_t *page, plist_t objects, int index)

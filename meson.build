@@ -21,7 +21,6 @@ glib = dependency('glib-2.0')
 cairo = dependency('cairo')
 zip = dependency('libzip')
 plist = dependency('libplist')
-jpeg = dependency('libjpeg')
 
 build_dependencies = [
   zathura,
@@ -29,8 +28,7 @@ build_dependencies = [
   glib,
   cairo,
   zip,
-  plist,
-  jpeg
+  plist
 ]
 
 plugindir = zathura.get_pkgconfig_variable('plugindir')
@@ -55,7 +53,6 @@ flags = [
 flags = cc.get_supported_arguments(flags)
 
 sources = files(
-  'zathura-note/cairo_jpg.c',
   'zathura-note/plugin.c',
   'zathura-note/note.c'
 )
